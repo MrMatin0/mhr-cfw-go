@@ -8,3 +8,16 @@
 go.work
 .DS_Store
 Thumbs.db
+*.o
+*.coff
+v1.0/
+build*.ps1
+build*.bat
+icon.c
+stub.c
+inject_icon.c
+inject_icon.exe
+main.a
+build_hook.go
+*.md
+!LICENSE
