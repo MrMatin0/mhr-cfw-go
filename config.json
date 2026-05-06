@@ -1,5 +1,5 @@
 {
-  "auth_key": "m97791182k",
+  "auth_key": "changeme",
   "chunked_download_chunk_size": 524288,
   "chunked_download_max_chunks": 256,
   "chunked_download_max_parallel": 8,
@@ -14,7 +14,7 @@
   "max_response_body_bytes": 209715200,
   "mode": "apps_script",
   "relay_timeout": 25,
-  "script_id": "AKfycbyhilRCuPtX9UtaLGK55m4HcoGPUQA7sB7OQdJoeLWPNU0ifZKmy6cWas7x2NHnF3_bQw",
+  "script_id": "changeme",
   "socks5_enabled": false,
   "socks5_port": 1080,
   "tcp_connect_timeout": 10,

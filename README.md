@@ -4,6 +4,7 @@
 **[فارسی](README_FA.md)**
 
 
+<img width="654" height="362" alt="image" src="https://github.com/user-attachments/assets/bdf8ffd8-f1cd-47b4-87fd-5bc6e2ce1937" />
 
 
 ## 🚀 Improvements Over Python Version
@@ -42,6 +43,14 @@ The program runs on your PC and sends your requests through Google's infrastruct
 
 ## Quick Start
 
+ ## 📦 Requirements:
+ - [Go 1.22+](https://go.dev/dl/)
+
+ **💡 Tip:** If you have trouble downloading Go dependencies, use the Runflare Iranian mirror:
+```bash
+GOPROXY=https://mirror-go.runflare.com go mod download
+```
+
 ### 1 - Clone and Build
 
 ```bash
@@ -49,7 +58,7 @@ git clone https://github.com/ThisIsDara/mhr-cfw-go.git
 cd mhr-cfw-go
 ```
 
-Or download the latest release from [GitHub Releases](https://github.com/ThisIsDara/mhr-cfw-go/releases)
+Or download the latest release from [ 📥 GitHub Releases](https://github.com/ThisIsDara/mhr-cfw-go/releases)
 
 ### 2 - Run build.bat
 
@@ -94,8 +103,8 @@ This installs the local Certificate Authority so the proxy can intercept HTTPs t
 
 # 🛠️ How to Setup
 
-1. Open [mhr-cfw README File](https://github.com/denuitt1/mhr-cfw/blob/main/README.md#how-to-use) and follow the steps provided by [denuitt1](https://github.com/denuitt1)
-
+1. Open [mhr-cfw README File](https://github.com/denuitt1/mhr-cfw/blob/main/README.md#how-to-use) provided by [denuitt1](https://github.com/denuitt1)
+ and follow the steps 1 to 3 until you have the Deployment ID
 
 ---
 ## Building from Source
