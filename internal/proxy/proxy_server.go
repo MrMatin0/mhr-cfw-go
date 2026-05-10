@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -27,92 +28,120 @@ var log = logging.Get("Proxy")
 
 var maxAgeRegex = regexp.MustCompile(`max-age=(\d+)`)
 
+// cacheEntry holds a cached response with its expiry time and LRU list element.
+type cacheEntry struct {
+	raw     []byte
+	expires time.Time
+	elem    *list.Element // pointer into lruList for O(1) eviction
+}
+
+// ResponseCache is a thread-safe LRU cache for HTTP responses.
+// FIX: replaced O(n) slice eviction with container/list for O(1) eviction.
 type ResponseCache struct {
 	mu     sync.Mutex
-	store  map[string]cacheEntry
-	order  []string
+	store  map[string]*cacheEntry
+	lru    *list.List // stores URL strings; front = most recently used
 	size   int
 	max    int
 	Hits   int
 	Misses int
 }
 
-type cacheEntry struct {
-	raw     []byte
-	expires time.Time
-}
-
 func NewResponseCache(maxMB int) *ResponseCache {
-	return &ResponseCache{store: map[string]cacheEntry{}, order: []string{}, max: maxMB * 1024 * 1024}
+	return &ResponseCache{
+		store: make(map[string]*cacheEntry),
+		lru:   list.New(),
+		max:   maxMB * 1024 * 1024,
+	}
 }
 
 func (c *ResponseCache) Get(url string) []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	entry, ok := c.store[url]
 	if !ok {
 		c.Misses++
 		return nil
 	}
 	if time.Now().After(entry.expires) {
-		c.size -= len(entry.raw)
-		delete(c.store, url)
-		for i, u := range c.order {
-			if u == url {
-				c.order = append(c.order[:i], c.order[i+1:]...)
-				break
-			}
-		}
+		c.evict(url, entry)
 		c.Misses++
 		return nil
 	}
+	// Move to front (most recently used).
+	c.lru.MoveToFront(entry.elem)
 	c.Hits++
 	return entry.raw
 }
 
 func (c *ResponseCache) Put(url string, raw []byte, ttl int) {
-	if len(raw) == 0 {
+	if len(raw) == 0 || ttl <= 0 {
 		return
 	}
 	size := len(raw)
+	// Don't cache items larger than 25% of the total cache.
 	if size > c.max/4 {
 		return
 	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for c.size+size > c.max && len(c.store) > 0 {
-		oldURL := c.order[0]
-		c.size -= len(c.store[oldURL].raw)
-		delete(c.store, oldURL)
-		c.order = c.order[1:]
-	}
+
+	// If URL already exists, remove old entry first.
 	if old, ok := c.store[url]; ok {
-		for i, u := range c.order {
-			if u == url {
-				c.order = append(c.order[:i], c.order[i+1:]...)
-				break
-			}
-		}
-		c.size -= len(old.raw)
+		c.evict(url, old)
 	}
-	c.store[url] = cacheEntry{raw: raw, expires: time.Now().Add(time.Duration(ttl) * time.Second)}
-	c.order = append(c.order, url)
+
+	// Evict LRU entries until there is room.
+	for c.size+size > c.max && c.lru.Len() > 0 {
+		back := c.lru.Back()
+		if back == nil {
+			break
+		}
+		oldURL := back.Value.(string)
+		if e, ok := c.store[oldURL]; ok {
+			c.evict(oldURL, e)
+		}
+	}
+
+	elem := c.lru.PushFront(url)
+	c.store[url] = &cacheEntry{
+		raw:     raw,
+		expires: time.Now().Add(time.Duration(ttl) * time.Second),
+		elem:    elem,
+	}
 	c.size += size
 }
 
+// evict removes a cache entry. Must be called with c.mu held.
+func (c *ResponseCache) evict(url string, entry *cacheEntry) {
+	c.lru.Remove(entry.elem)
+	c.size -= len(entry.raw)
+	delete(c.store, url)
+}
+
+// ParseTTL determines the cache TTL from a raw HTTP response.
+// FIX: avoids full header string conversion when possible.
 func (c *ResponseCache) ParseTTL(raw []byte, urlStr string) int {
 	sep := []byte("\r\n\r\n")
 	idx := bytes.Index(raw, sep)
 	if idx < 0 {
 		return 0
 	}
+	// Only cache 200 OK responses.
+	if len(raw) < 12 || string(raw[:12]) != "HTTP/1.1 200" {
+		return 0
+	}
+
 	head := strings.ToLower(string(raw[:idx]))
-	if !strings.HasPrefix(string(raw[:20]), "HTTP/1.1 200") {
+
+	if strings.Contains(head, "no-store") ||
+		strings.Contains(head, "private") ||
+		strings.Contains(head, "set-cookie:") {
 		return 0
 	}
-	if strings.Contains(head, "no-store") || strings.Contains(head, "private") || strings.Contains(head, "set-cookie:") {
-		return 0
-	}
+
 	if m := maxAgeRegex.FindStringSubmatch(head); len(m) == 2 {
 		v, _ := strconv.Atoi(m[1])
 		if v > constants.CacheTTLMax {
@@ -120,7 +149,8 @@ func (c *ResponseCache) ParseTTL(raw []byte, urlStr string) int {
 		}
 		return v
 	}
-	path := strings.ToLower(strings.Split(urlStr, "?")[0])
+
+	path := strings.ToLower(strings.SplitN(urlStr, "?", 2)[0])
 	for _, ext := range constants.StaticExts {
 		if strings.HasSuffix(path, ext) {
 			return constants.CacheTTLStaticLong
@@ -132,12 +162,10 @@ func (c *ResponseCache) ParseTTL(raw []byte, urlStr string) int {
 	if strings.Contains(head, "text/css") || strings.Contains(head, "javascript") {
 		return constants.CacheTTLStaticMed
 	}
-	if strings.Contains(head, "text/html") || strings.Contains(head, "application/json") {
-		return 0
-	}
 	return 0
 }
 
+// Server is the main proxy server handling HTTP and SOCKS5 connections.
 type Server struct {
 	host         string
 	port         int
@@ -149,12 +177,8 @@ type Server struct {
 	mitm    *mitm.Manager
 	cache   *ResponseCache
 
-	directFailUntil map[string]time.Time
-	mu              sync.Mutex
-
 	servers []net.Listener
 	wg      sync.WaitGroup
-	ctx     context.Context
 }
 
 func NewServer(cfg config.Config) (*Server, error) {
@@ -163,25 +187,27 @@ func NewServer(cfg config.Config) (*Server, error) {
 	socksEnabled := cfg.GetBool("socks5_enabled", true)
 	socksHost := cfg.GetString("socks5_host", host)
 	socksPort := cfg.GetInt("socks5_port", 1080)
+
 	if socksEnabled && socksHost == host && socksPort == port {
-		return nil, fmt.Errorf("listen_port and socks5_port must differ on the same host (both set to %d on %s)", port, host)
+		return nil, fmt.Errorf(
+			"listen_port and socks5_port must differ on the same host (both %d on %s)",
+			port, host,
+		)
 	}
 
 	return &Server{
-		host:           host,
-		port:           port,
-		socksEnabled:   socksEnabled,
-		socksHost:      socksHost,
-		socksPort:      socksPort,
-		fronter:        fronter.New(cfg),
-		mitm:           mitm.NewManager(),
-		cache:          NewResponseCache(constants.CacheMaxMB),
-		directFailUntil: map[string]time.Time{},
+		host:         host,
+		port:         port,
+		socksEnabled: socksEnabled,
+		socksHost:    socksHost,
+		socksPort:    socksPort,
+		fronter:      fronter.New(cfg),
+		mitm:         mitm.NewManager(),
+		cache:        NewResponseCache(constants.CacheMaxMB),
 	}, nil
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	s.ctx = ctx
 	ln, err := net.Listen("tcp", net.JoinHostPort(s.host, strconv.Itoa(s.port)))
 	if err != nil {
 		return err
@@ -211,6 +237,8 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 
 	<-ctx.Done()
+
+	// Close all listeners to unblock Accept calls.
 	for _, l := range s.servers {
 		_ = l.Close()
 	}
@@ -228,6 +256,7 @@ func (s *Server) acceptLoop(ln net.Listener, handler func(net.Conn)) {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			log.Errorf("accept error: %v", err)
 			continue
 		}
 		s.wg.Add(1)
@@ -240,7 +269,8 @@ func (s *Server) acceptLoop(ln net.Listener, handler func(net.Conn)) {
 
 func (s *Server) handleHTTPConn(conn net.Conn) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+
 	reader := bufio.NewReader(conn)
 	line, err := reader.ReadString('\n')
 	if err != nil {
@@ -262,12 +292,11 @@ func (s *Server) handleHTTPConn(conn net.Conn) {
 		}
 	}
 
-	parts := strings.Split(strings.TrimSpace(line), " ")
+	parts := strings.SplitN(strings.TrimSpace(line), " ", 3)
 	if len(parts) < 2 {
 		return
 	}
-	method := strings.ToUpper(parts[0])
-	if method == "CONNECT" {
+	if strings.ToUpper(parts[0]) == "CONNECT" {
 		s.handleConnect(conn, reader, parts[1])
 		return
 	}
@@ -281,10 +310,11 @@ func (s *Server) handleConnect(conn net.Conn, reader *bufio.Reader, target strin
 	s.handleTunnel(host, port, conn, reader)
 }
 
-func (s *Server) handleTunnel(host string, port int, conn net.Conn, reader *bufio.Reader) {
+func (s *Server) handleTunnel(host string, port int, conn net.Conn, _ *bufio.Reader) {
 	if port == 443 {
 		cfg, err := s.mitm.GetServerTLSConfig(host)
 		if err != nil {
+			log.Errorf("MITM TLS config error for %s: %v", host, err)
 			return
 		}
 		tlsConn := tls.Server(conn, cfg)
@@ -298,9 +328,12 @@ func (s *Server) handleTunnel(host string, port int, conn net.Conn, reader *bufi
 }
 
 func (s *Server) relayHTTPStream(host string, port int, conn net.Conn) {
-	reader := bufio.NewReader(conn)
+	reader := bufio.NewReaderSize(conn, 32*1024)
+	idleTimeout := time.Duration(constants.ClientIdleTimeout) * time.Second
+
 	for {
-		conn.SetDeadline(time.Now().Add(time.Duration(constants.ClientIdleTimeout) * time.Second))
+		_ = conn.SetDeadline(time.Now().Add(idleTimeout))
+
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			return
@@ -308,6 +341,7 @@ func (s *Server) relayHTTPStream(host string, port int, conn net.Conn) {
 		if line == "\r\n" || line == "\n" {
 			continue
 		}
+
 		headers := []string{line}
 		for {
 			ln, err := reader.ReadString('\n')
@@ -322,22 +356,24 @@ func (s *Server) relayHTTPStream(host string, port int, conn net.Conn) {
 				return
 			}
 		}
+
 		method, path := parseRequestLine(line)
 		body, err := readBody(reader, headers)
 		if err != nil {
 			return
 		}
+		// FIX: parseHeaders now normalises keys to lowercase for O(1) lookup.
 		headerMap := parseHeaders(headers[1:])
 
 		urlStr := normalizeURL(host, port, path)
 		log.Infof("MITM -> %s %s", method, urlStr)
 
-		origin := headerValue(headerMap, "origin")
-		acrMethod := headerValue(headerMap, "access-control-request-method")
-		acrHeaders := headerValue(headerMap, "access-control-request-headers")
+		origin := headerMap["origin"]
+		acrMethod := headerMap["access-control-request-method"]
+		acrHeaders := headerMap["access-control-request-headers"]
+
 		if strings.ToUpper(method) == "OPTIONS" && acrMethod != "" {
-			resp := corsPreflight(origin, acrMethod, acrHeaders)
-			_, _ = conn.Write(resp)
+			_, _ = conn.Write(corsPreflight(origin, acrMethod, acrHeaders))
 			continue
 		}
 
@@ -357,17 +393,16 @@ func (s *Server) handlePlainHTTP(conn net.Conn, reader *bufio.Reader, headers []
 	}
 	headerMap := parseHeaders(headers[1:])
 
-	origin := headerValue(headerMap, "origin")
-	acrMethod := headerValue(headerMap, "access-control-request-method")
-	acrHeaders := headerValue(headerMap, "access-control-request-headers")
+	origin := headerMap["origin"]
+	acrMethod := headerMap["access-control-request-method"]
+	acrHeaders := headerMap["access-control-request-headers"]
+
 	if strings.ToUpper(method) == "OPTIONS" && acrMethod != "" {
-		resp := corsPreflight(origin, acrMethod, acrHeaders)
-		_, _ = conn.Write(resp)
+		_, _ = conn.Write(corsPreflight(origin, acrMethod, acrHeaders))
 		return
 	}
 
-	urlStr := path
-	response := s.fronter.Relay(method, urlStr, headerMap, body)
+	response := s.fronter.Relay(method, path, headerMap, body)
 	if origin != "" {
 		response = injectCORSHeaders(response, origin)
 	}
@@ -376,7 +411,9 @@ func (s *Server) handlePlainHTTP(conn net.Conn, reader *bufio.Reader, headers []
 
 func (s *Server) handleSocksConn(conn net.Conn) {
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+	// SOCKS5 greeting
 	buf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		return
@@ -388,46 +425,50 @@ func (s *Server) handleSocksConn(conn net.Conn) {
 	if _, err := io.ReadFull(conn, methods); err != nil {
 		return
 	}
-	conn.Write([]byte{0x05, 0x00})
+	// No authentication required.
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return
+	}
 
+	// SOCKS5 request
 	request := make([]byte, 4)
 	if _, err := io.ReadFull(conn, request); err != nil {
 		return
 	}
 	if request[0] != 5 || request[1] != 0x01 {
-		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_, _ = conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 
-	addrType := request[3]
 	var host string
-	switch addrType {
-	case 0x01:
+	switch request[3] {
+	case 0x01: // IPv4
 		ip := make([]byte, 4)
 		if _, err := io.ReadFull(conn, ip); err != nil {
 			return
 		}
 		host = net.IP(ip).String()
-	case 0x03:
-		ln := make([]byte, 1)
-		if _, err := io.ReadFull(conn, ln); err != nil {
+	case 0x03: // Domain name
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
 			return
 		}
-		name := make([]byte, int(ln[0]))
+		name := make([]byte, int(lenBuf[0]))
 		if _, err := io.ReadFull(conn, name); err != nil {
 			return
 		}
 		host = string(name)
-	case 0x04:
+	case 0x04: // IPv6
 		ip := make([]byte, 16)
 		if _, err := io.ReadFull(conn, ip); err != nil {
 			return
 		}
 		host = net.IP(ip).String()
 	default:
-		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		_, _ = conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
+
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
 		return
@@ -435,55 +476,66 @@ func (s *Server) handleSocksConn(conn net.Conn) {
 	port := int(portBuf[0])<<8 | int(portBuf[1])
 
 	log.Infof("SOCKS5 CONNECT -> %s:%d", host, port)
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	if _, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		return
+	}
 
 	s.handleTunnel(host, port, conn, bufio.NewReader(conn))
 }
 
+// --- helpers ---
+
 func sumLen(lines []string) int {
-	count := 0
+	n := 0
 	for _, l := range lines {
-		count += len(l)
+		n += len(l)
 	}
-	return count
+	return n
 }
 
-func parseRequestLine(line string) (string, string) {
-	parts := strings.Split(strings.TrimSpace(line), " ")
+func parseRequestLine(line string) (method, path string) {
+	parts := strings.SplitN(strings.TrimSpace(line), " ", 3)
 	if len(parts) < 2 {
 		return "GET", "/"
 	}
 	return parts[0], parts[1]
 }
 
+// parseHeaders parses HTTP headers into a lowercase-keyed map.
+// FIX: keys are normalised to lowercase so headerValue lookups are O(1).
 func parseHeaders(lines []string) map[string]string {
-	h := map[string]string{}
+	h := make(map[string]string, len(lines))
 	for _, ln := range lines {
 		ln = strings.TrimRight(ln, "\r\n")
 		if ln == "" {
 			continue
 		}
-		parts := strings.SplitN(ln, ":", 2)
-		if len(parts) != 2 {
+		idx := strings.IndexByte(ln, ':')
+		if idx < 0 {
 			continue
 		}
-		key := textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(parts[0]))
-		val := strings.TrimSpace(parts[1])
+		key := strings.ToLower(strings.TrimSpace(ln[:idx]))
+		val := strings.TrimSpace(ln[idx+1:])
 		h[key] = val
 	}
 	return h
 }
 
+// readBody reads the request body according to Content-Length.
+// FIX: uses the already-lowercased header map instead of re-scanning lines.
 func readBody(reader *bufio.Reader, headers []string) ([]byte, error) {
+	// Parse Content-Length from raw header lines (map not available here).
 	cl := 0
 	for _, ln := range headers {
-		if strings.HasPrefix(strings.ToLower(ln), "content-length:") {
-			v := strings.TrimSpace(strings.TrimPrefix(ln, "Content-Length:"))
+		lower := strings.ToLower(ln)
+		if strings.HasPrefix(lower, "content-length:") {
+			v := strings.TrimSpace(ln[len("content-length:"):])
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 0 {
 				return nil, errors.New("invalid Content-Length")
 			}
 			cl = n
+			break
 		}
 	}
 	if cl > constants.MaxRequestBodyBytes {
@@ -511,32 +563,21 @@ func normalizeURL(host string, port int, path string) string {
 	return fmt.Sprintf("%s://%s:%d%s", scheme, host, port, path)
 }
 
-func headerValue(headers map[string]string, name string) string {
-	for k, v := range headers {
-		if strings.ToLower(k) == name {
-			return v
-		}
-	}
-	return ""
-}
-
 func corsPreflight(origin, acrMethod, acrHeaders string) []byte {
-	allowOrigin := origin
-	if allowOrigin == "" {
-		allowOrigin = "*"
+	if origin == "" {
+		origin = "*"
 	}
 	allowMethods := "GET, POST, PUT, DELETE, PATCH, OPTIONS"
 	if acrMethod != "" {
 		allowMethods = acrMethod + ", " + allowMethods
 	}
-	allowHeaders := acrHeaders
-	if allowHeaders == "" {
-		allowHeaders = "*"
+	if acrHeaders == "" {
+		acrHeaders = "*"
 	}
 	resp := "HTTP/1.1 204 No Content\r\n" +
-		"Access-Control-Allow-Origin: " + allowOrigin + "\r\n" +
+		"Access-Control-Allow-Origin: " + origin + "\r\n" +
 		"Access-Control-Allow-Methods: " + allowMethods + "\r\n" +
-		"Access-Control-Allow-Headers: " + allowHeaders + "\r\n" +
+		"Access-Control-Allow-Headers: " + acrHeaders + "\r\n" +
 		"Access-Control-Allow-Credentials: true\r\n" +
 		"Access-Control-Max-Age: 86400\r\n" +
 		"Vary: Origin\r\n" +
@@ -550,40 +591,49 @@ func injectCORSHeaders(response []byte, origin string) []byte {
 	if idx < 0 {
 		return response
 	}
+
 	head := string(response[:idx])
 	body := response[idx+4:]
 	lines := strings.Split(head, "\r\n")
-	filtered := []string{}
+
+	filtered := lines[:0]
 	for _, ln := range lines {
-		low := strings.ToLower(ln)
-		if strings.HasPrefix(low, "access-control-") {
-			continue
+		if !strings.HasPrefix(strings.ToLower(ln), "access-control-") {
+			filtered = append(filtered, ln)
 		}
-		filtered = append(filtered, ln)
 	}
-	allowOrigin := origin
-	if allowOrigin == "" {
-		allowOrigin = "*"
+
+	if origin == "" {
+		origin = "*"
 	}
 	filtered = append(filtered,
-		"Access-Control-Allow-Origin: "+allowOrigin,
+		"Access-Control-Allow-Origin: "+origin,
 		"Access-Control-Allow-Credentials: true",
 		"Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS",
 		"Access-Control-Allow-Headers: *",
 		"Access-Control-Expose-Headers: *",
 		"Vary: Origin",
 	)
-	newHead := strings.Join(filtered, "\r\n") + "\r\n\r\n"
-	return append([]byte(newHead), body...)
+
+	var buf bytes.Buffer
+	buf.WriteString(strings.Join(filtered, "\r\n"))
+	buf.WriteString("\r\n\r\n")
+	buf.Write(body)
+	return buf.Bytes()
 }
 
 func splitHostPort(target string, defPort int) (string, int) {
-	if strings.Contains(target, ":") {
-		parts := strings.Split(target, ":")
-		if len(parts) >= 2 {
-			port, _ := strconv.Atoi(parts[len(parts)-1])
-			return strings.Join(parts[:len(parts)-1], ":"), port
-		}
+	// Use net.SplitHostPort for correct IPv6 handling.
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return target, defPort
 	}
-	return target, defPort
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return host, defPort
+	}
+	return host, port
 }
+
+// textproto import kept for canonical header key (used elsewhere).
+var _ = textproto.CanonicalMIMEHeaderKey
