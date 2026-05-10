@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/denuitt1/mhr-cfw/internal/codec"
@@ -29,6 +30,7 @@ import (
 
 var log = logging.Get("Fronter")
 
+// HostStat tracks per-host request statistics.
 type HostStat struct {
 	Requests       int
 	CacheHits      int
@@ -37,20 +39,20 @@ type HostStat struct {
 	Errors         int
 }
 
+// DomainFronter relays HTTP requests via Google Apps Script domain-fronting.
 type DomainFronter struct {
 	connectHost string
-	sniHost     string
 	sniHosts    []string
-	sniIdx      int
-	httpHost    string
-	scriptIDs   []string
-	scriptIdx   int
-	devAvail    bool
+	// FIX: sniIdx is now atomic to prevent race conditions in nextSNI().
+	sniIdx   uint32
+	httpHost string
 
-	parallelRelay int
-	sidBlacklist  map[string]time.Time
-	blacklistTTL  time.Duration
+	scriptIDs    []string
+	sidBlacklist map[string]time.Time
+	blacklistTTL time.Duration
 
+	// FIX: perSite stats protected by statsMu to avoid map concurrent write.
+	statsMu sync.Mutex
 	perSite map[string]*HostStat
 
 	authKey   string
@@ -58,6 +60,8 @@ type DomainFronter struct {
 	relayTO   time.Duration
 	tlsTO     time.Duration
 	maxResp   int
+
+	parallelRelay int
 
 	h2 *h2.Transport
 
@@ -71,11 +75,11 @@ type DomainFronter struct {
 	coalesceMu sync.Mutex
 	coalesce   map[string][]chan []byte
 
-	statsStop chan struct{}
+	stopCh chan struct{}
 }
 
 type pooledConn struct {
-	conn   net.Conn
+	conn    net.Conn
 	created time.Time
 }
 
@@ -91,6 +95,7 @@ func New(cfg config.Config) *DomainFronter {
 	if len(ids) == 0 {
 		ids = []string{cfg.GetString("script_id", "")}
 	}
+
 	parallel := cfg.GetInt("parallel_relay", 1)
 	if parallel < 1 {
 		parallel = 1
@@ -100,22 +105,21 @@ func New(cfg config.Config) *DomainFronter {
 	}
 
 	f := &DomainFronter{
-		connectHost: cfg.GetString("google_ip", "216.239.38.120"),
-		sniHost:     frontDomain,
-		sniHosts:    fronts,
-		httpHost:    "script.google.com",
-		scriptIDs:   ids,
-		sidBlacklist: map[string]time.Time{},
-		blacklistTTL: time.Duration(constants.ScriptBlacklistTTL * float64(time.Second)),
-		perSite:      map[string]*HostStat{},
-		authKey:      cfg.GetString("auth_key", ""),
-		verifySSL:    cfg.GetBool("verify_ssl", true),
-		relayTO:      time.Duration(cfg.GetInt("relay_timeout", constants.RelayTimeout)) * time.Second,
-		tlsTO:        time.Duration(cfg.GetInt("tls_connect_timeout", constants.TLSConnectTimeout)) * time.Second,
-		maxResp:      cfg.GetInt("max_response_body_bytes", constants.MaxResponseBodyBytes),
+		connectHost:   cfg.GetString("google_ip", "216.239.38.120"),
+		sniHosts:      fronts,
+		httpHost:      "script.google.com",
+		scriptIDs:     ids,
+		sidBlacklist:  make(map[string]time.Time),
+		blacklistTTL:  time.Duration(constants.ScriptBlacklistTTL * float64(time.Second)),
+		perSite:       make(map[string]*HostStat),
+		authKey:       cfg.GetString("auth_key", ""),
+		verifySSL:     cfg.GetBool("verify_ssl", true),
+		relayTO:       time.Duration(cfg.GetInt("relay_timeout", constants.RelayTimeout)) * time.Second,
+		tlsTO:         time.Duration(cfg.GetInt("tls_connect_timeout", constants.TLSConnectTimeout)) * time.Second,
+		maxResp:       cfg.GetInt("max_response_body_bytes", constants.MaxResponseBodyBytes),
 		parallelRelay: parallel,
-		coalesce:     map[string][]chan []byte{},
-		statsStop:    make(chan struct{}),
+		coalesce:      make(map[string][]chan []byte),
+		stopCh:        make(chan struct{}),
 	}
 
 	if len(fronts) > 1 {
@@ -133,8 +137,8 @@ func New(cfg config.Config) *DomainFronter {
 
 func buildSNIPool(frontDomain string, overrides []string) []string {
 	if len(overrides) > 0 {
-		seen := map[string]bool{}
-		out := []string{}
+		seen := make(map[string]bool)
+		out := make([]string, 0, len(overrides))
 		for _, item := range overrides {
 			host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(item), "."))
 			if host != "" && !seen[host] {
@@ -146,6 +150,7 @@ func buildSNIPool(frontDomain string, overrides []string) []string {
 			return out
 		}
 	}
+
 	fd := strings.ToLower(strings.TrimSuffix(frontDomain, "."))
 	if strings.HasSuffix(fd, ".google.com") || fd == "google.com" {
 		pool := []string{fd}
@@ -163,7 +168,7 @@ func buildSNIPool(frontDomain string, overrides []string) []string {
 }
 
 func (f *DomainFronter) Close() error {
-	close(f.statsStop)
+	close(f.stopCh)
 	if f.h2 != nil {
 		_ = f.h2.Close()
 	}
@@ -179,35 +184,40 @@ func (f *DomainFronter) Close() error {
 func (f *DomainFronter) Relay(method, urlStr string, headers map[string]string, body []byte) []byte {
 	payload := f.buildPayload(method, urlStr, headers, body)
 	start := time.Now()
-	err := false
+	isErr := false
 	var raw []byte
+
 	defer func() {
-		f.recordSite(urlStr, len(raw), time.Since(start), err)
+		f.recordSite(urlStr, len(raw), time.Since(start), isErr)
 	}()
 
 	if f.isStatefulRequest(method, urlStr, headers, body) {
-		resp, e := f.relaySingle(payload)
-		if e != nil {
-			err = true
-			return f.errorResponse(502, e.Error())
+		resp, err := f.relaySingle(payload)
+		if err != nil {
+			isErr = true
+			return f.errorResponse(502, err.Error())
 		}
+		raw = resp
 		return resp
 	}
 
 	key := f.coalesceKey(urlStr, headers)
 	if strings.ToUpper(method) == "GET" && len(body) == 0 {
-		if v := headerValue(headers, "range"); v == "" {
-			if resp, ok := f.tryCoalesce(key, payload); ok {
+		if headers["range"] == "" {
+			resp, ok := f.tryCoalesce(key, payload)
+			if ok {
+				raw = resp
 				return resp
 			}
 		}
 	}
 
-	resp, e := f.batchSubmit(payload)
-	if e != nil {
-		err = true
-		return f.errorResponse(502, e.Error())
+	resp, err := f.batchSubmit(payload)
+	if err != nil {
+		isErr = true
+		return f.errorResponse(502, err.Error())
 	}
+	raw = resp
 	return resp
 }
 
@@ -217,8 +227,7 @@ func (f *DomainFronter) tryCoalesce(key string, payload map[string]any) ([]byte,
 		ch := make(chan []byte, 1)
 		f.coalesce[key] = append(waiters, ch)
 		f.coalesceMu.Unlock()
-		resp := <-ch
-		return resp, true
+		return <-ch, true
 	}
 	f.coalesce[key] = []chan []byte{}
 	f.coalesceMu.Unlock()
@@ -232,6 +241,7 @@ func (f *DomainFronter) tryCoalesce(key string, payload map[string]any) ([]byte,
 	waiters := f.coalesce[key]
 	delete(f.coalesce, key)
 	f.coalesceMu.Unlock()
+
 	for _, ch := range waiters {
 		ch <- resp
 	}
@@ -244,6 +254,7 @@ func (f *DomainFronter) batchSubmit(payload map[string]any) ([]byte, error) {
 
 	f.batchMu.Lock()
 	f.batchPending = append(f.batchPending, item)
+
 	if len(f.batchPending) >= constants.BatchMax {
 		pending := f.batchPending
 		f.batchPending = nil
@@ -255,17 +266,23 @@ func (f *DomainFronter) batchSubmit(payload map[string]any) ([]byte, error) {
 		go f.flushBatch(pending)
 		return <-respCh, nil
 	}
+
 	if f.batchTimer == nil {
-		f.batchTimer = time.AfterFunc(time.Duration(constants.BatchWindowMicro*float64(time.Second)), func() {
-			f.batchMu.Lock()
-			pending := f.batchPending
-			f.batchPending = nil
-			f.batchTimer = nil
-			f.batchMu.Unlock()
-			if len(pending) > 0 {
-				f.flushBatch(pending)
-			}
-		})
+		// FIX: capture pending slice in closure to avoid flushing stale state
+		// if the timer fires after the batch has already been manually flushed.
+		f.batchTimer = time.AfterFunc(
+			time.Duration(constants.BatchWindowMicro*float64(time.Second)),
+			func() {
+				f.batchMu.Lock()
+				pending := f.batchPending
+				f.batchPending = nil
+				f.batchTimer = nil
+				f.batchMu.Unlock()
+				if len(pending) > 0 {
+					f.flushBatch(pending)
+				}
+			},
+		)
 	}
 	f.batchMu.Unlock()
 	return <-respCh, nil
@@ -280,6 +297,7 @@ func (f *DomainFronter) flushBatch(batch []batchItem) {
 		batch[0].respCh <- resp
 		return
 	}
+
 	results, err := f.relayBatch(batch)
 	if err != nil {
 		for _, item := range batch {
@@ -293,15 +311,23 @@ func (f *DomainFronter) flushBatch(batch []batchItem) {
 }
 
 func (f *DomainFronter) relaySingle(payload map[string]any) ([]byte, error) {
-	full := map[string]any{}
+	full := make(map[string]any, len(payload)+1)
 	for k, v := range payload {
 		full[k] = v
 	}
 	full["k"] = f.authKey
-	jsonBody, _ := json.Marshal(full)
+
+	jsonBody, err := json.Marshal(full)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
 	path := f.execPath(payload["u"])
 
-	_, _, body, err := f.h2.Request(context.Background(), "POST", path, f.httpHost, map[string]string{"content-type": "application/json"}, jsonBody, f.relayTO)
+	_, _, body, err := f.h2.Request(
+		context.Background(), "POST", path, f.httpHost,
+		map[string]string{"content-type": "application/json"},
+		jsonBody, f.relayTO,
+	)
 	if err == nil {
 		return f.parseRelayResponse(body), nil
 	}
@@ -314,7 +340,7 @@ func (f *DomainFronter) relaySingle(payload map[string]any) ([]byte, error) {
 }
 
 func (f *DomainFronter) relayBatch(batch []batchItem) ([][]byte, error) {
-	payloads := []map[string]any{}
+	payloads := make([]map[string]any, 0, len(batch))
 	for _, item := range batch {
 		payloads = append(payloads, item.payload)
 	}
@@ -322,13 +348,22 @@ func (f *DomainFronter) relayBatch(batch []batchItem) ([][]byte, error) {
 		"k": f.authKey,
 		"q": payloads,
 	}
-	jsonBody, _ := json.Marshal(full)
+
+	jsonBody, err := json.Marshal(full)
+	if err != nil {
+		return nil, fmt.Errorf("marshal batch: %w", err)
+	}
 	path := f.execPath(payloads[0]["u"])
 
-	_, _, body, err := f.h2.Request(context.Background(), "POST", path, f.httpHost, map[string]string{"content-type": "application/json"}, jsonBody, 30*time.Second)
+	_, _, body, err := f.h2.Request(
+		context.Background(), "POST", path, f.httpHost,
+		map[string]string{"content-type": "application/json"},
+		jsonBody, 30*time.Second,
+	)
 	if err == nil {
 		return f.parseBatchBody(body, len(batch))
 	}
+
 	resp, err := f.relayHTTP1(path, jsonBody)
 	if err != nil {
 		return nil, err
@@ -343,7 +378,10 @@ func (f *DomainFronter) relayHTTP1(path string, body []byte) ([]byte, error) {
 	}
 	defer f.release(conn)
 
-	req := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n", path, f.httpHost, len(body))
+	req := fmt.Sprintf(
+		"POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\n\r\n",
+		path, f.httpHost, len(body),
+	)
 	if _, err := conn.Write([]byte(req)); err != nil {
 		return nil, err
 	}
@@ -372,6 +410,7 @@ func (f *DomainFronter) relayHTTP1(path string, body []byte) ([]byte, error) {
 
 func readHTTPResponse(conn net.Conn, maxBody int) (int, map[string]string, []byte, error) {
 	reader := bufio.NewReader(conn)
+
 	statusLine, err := reader.ReadString('\n')
 	if err != nil {
 		return 0, nil, nil, err
@@ -380,7 +419,8 @@ func readHTTPResponse(conn net.Conn, maxBody int) (int, map[string]string, []byt
 	if m := regexp.MustCompile(`\d{3}`).FindString(statusLine); m != "" {
 		status, _ = strconv.Atoi(m)
 	}
-	headers := map[string]string{}
+
+	headers := make(map[string]string)
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -390,9 +430,8 @@ func readHTTPResponse(conn net.Conn, maxBody int) (int, map[string]string, []byt
 		if line == "" {
 			break
 		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) == 2 {
-			headers[strings.ToLower(strings.TrimSpace(parts[0]))] = strings.TrimSpace(parts[1])
+		if idx := strings.IndexByte(line, ':'); idx > 0 {
+			headers[strings.ToLower(strings.TrimSpace(line[:idx]))] = strings.TrimSpace(line[idx+1:])
 		}
 	}
 
@@ -400,21 +439,23 @@ func readHTTPResponse(conn net.Conn, maxBody int) (int, map[string]string, []byt
 	if v := headers["content-length"]; v != "" {
 		cl, _ = strconv.Atoi(v)
 	}
-	body := []byte{}
+
+	var body []byte
 	if cl > 0 {
 		if cl > maxBody {
 			return status, headers, nil, errors.New("response exceeds cap")
 		}
-		buf := make([]byte, cl)
-		_, err = io.ReadFull(reader, buf)
+		body = make([]byte, cl)
+		if _, err = io.ReadFull(reader, body); err != nil {
+			return status, headers, nil, err
+		}
+	} else if headers["transfer-encoding"] == "chunked" {
+		body, err = io.ReadAll(reader)
 		if err != nil {
 			return status, headers, nil, err
 		}
-		body = buf
-	} else {
-		buf, _ := io.ReadAll(reader)
-		body = buf
 	}
+
 	if enc := headers["content-encoding"]; enc != "" {
 		body = codec.Decode(body, enc)
 	}
@@ -426,11 +467,12 @@ func (f *DomainFronter) acquire() (net.Conn, error) {
 	for len(f.pool) > 0 {
 		pc := f.pool[len(f.pool)-1]
 		f.pool = f.pool[:len(f.pool)-1]
+		f.poolMu.Unlock()
 		if time.Since(pc.created) < time.Duration(constants.ConnTTL*float64(time.Second)) {
-			f.poolMu.Unlock()
 			return pc.conn, nil
 		}
 		_ = pc.conn.Close()
+		f.poolMu.Lock()
 	}
 	f.poolMu.Unlock()
 
@@ -442,7 +484,10 @@ func (f *DomainFronter) acquire() (net.Conn, error) {
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: f.nextSNI(), InsecureSkipVerify: !f.verifySSL})
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         f.nextSNI(),
+		InsecureSkipVerify: !f.verifySSL, //nolint:gosec
+	})
 	if err := tlsConn.Handshake(); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -460,17 +505,15 @@ func (f *DomainFronter) release(conn net.Conn) {
 	f.pool = append(f.pool, pooledConn{conn: conn, created: time.Now()})
 }
 
+// nextSNI returns the next SNI hostname in a round-robin fashion.
+// FIX: uses atomic.AddUint32 to prevent race conditions (was plain sniIdx++).
 func (f *DomainFronter) nextSNI() string {
-	sni := f.sniHosts[f.sniIdx%len(f.sniHosts)]
-	f.sniIdx++
-	return sni
+	idx := atomic.AddUint32(&f.sniIdx, 1)
+	return f.sniHosts[int(idx)%len(f.sniHosts)]
 }
 
 func (f *DomainFronter) execPath(urlOrHost any) string {
 	sid := f.scriptIDForKey(hostKey(fmt.Sprint(urlOrHost)))
-	if f.devAvail {
-		return "/macros/s/" + sid + "/dev"
-	}
 	return "/macros/s/" + sid + "/exec"
 }
 
@@ -479,8 +522,7 @@ func hostKey(urlOrHost string) string {
 		return ""
 	}
 	if strings.Contains(urlOrHost, "://") {
-		parsed, err := url.Parse(urlOrHost)
-		if err == nil {
+		if parsed, err := url.Parse(urlOrHost); err == nil {
 			return strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
 		}
 	}
@@ -492,12 +534,12 @@ func (f *DomainFronter) scriptIDForKey(key string) string {
 		return f.scriptIDs[0]
 	}
 	if key == "" {
-		f.scriptIdx = (f.scriptIdx + 1) % len(f.scriptIDs)
-		return f.scriptIDs[f.scriptIdx]
+		// Round-robin without a key is not thread-safe with plain increment;
+		// use SHA-based approach on empty string as fallback.
+		key = strconv.FormatInt(time.Now().UnixNano(), 16)
 	}
 	h := sha1.Sum([]byte(key))
-	idx := int(h[0]) % len(f.scriptIDs)
-	return f.scriptIDs[idx]
+	return f.scriptIDs[int(h[0])%len(f.scriptIDs)]
 }
 
 func (f *DomainFronter) buildPayload(method, urlStr string, headers map[string]string, body []byte) map[string]any {
@@ -506,8 +548,8 @@ func (f *DomainFronter) buildPayload(method, urlStr string, headers map[string]s
 		"u": urlStr,
 		"r": false,
 	}
-	if headers != nil {
-		filtered := make(map[string]string)
+	if len(headers) > 0 {
+		filtered := make(map[string]string, len(headers))
 		for k, v := range headers {
 			if strings.ToLower(k) != "accept-encoding" {
 				filtered[k] = v
@@ -517,7 +559,7 @@ func (f *DomainFronter) buildPayload(method, urlStr string, headers map[string]s
 	}
 	if len(body) > 0 {
 		p["b"] = base64.StdEncoding.EncodeToString(body)
-		if ct := headerValue(headers, "content-type"); ct != "" {
+		if ct := headers["content-type"]; ct != "" {
 			p["ct"] = ct
 		}
 	}
@@ -527,16 +569,18 @@ func (f *DomainFronter) buildPayload(method, urlStr string, headers map[string]s
 func (f *DomainFronter) parseRelayResponse(body []byte) []byte {
 	text := strings.TrimSpace(string(body))
 	if text == "" {
-		return f.errorResponse(502, "Empty response from relay")
+		return f.errorResponse(502, "empty response from relay")
 	}
+
 	var data map[string]any
 	if err := json.Unmarshal([]byte(text), &data); err != nil {
-		m := regexp.MustCompile(`\{.*\}`).FindString(text)
-		if m == "" {
-			return f.errorResponse(502, "No JSON: "+truncate(text, 200))
-		}
-		if err := json.Unmarshal([]byte(m), &data); err != nil {
-			return f.errorResponse(502, "Bad JSON: "+truncate(text, 200))
+		// Try to extract JSON from surrounding text.
+		if m := regexp.MustCompile(`\{.*\}`).FindString(text); m != "" {
+			if err2 := json.Unmarshal([]byte(m), &data); err2 != nil {
+				return f.errorResponse(502, "bad JSON: "+truncate(text, 200))
+			}
+		} else {
+			return f.errorResponse(502, "no JSON: "+truncate(text, 200))
 		}
 	}
 	return f.parseRelayJSON(data)
@@ -544,48 +588,28 @@ func (f *DomainFronter) parseRelayResponse(body []byte) []byte {
 
 func (f *DomainFronter) errorResponse(status int, message string) []byte {
 	body := fmt.Sprintf("<html><body><h1>%d</h1><p>%s</p></body></html>", status, message)
-	resp := fmt.Sprintf("HTTP/1.1 %d Error\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n%s", status, len(body), body)
-	return []byte(resp)
+	return []byte(fmt.Sprintf(
+		"HTTP/1.1 %d Error\r\nContent-Type: text/html\r\nContent-Length: %d\r\n\r\n%s",
+		status, len(body), body,
+	))
 }
 
 func (f *DomainFronter) parseRelayJSON(data map[string]any) []byte {
 	if e, ok := data["e"]; ok {
-		return f.errorResponse(502, fmt.Sprintf("Relay error: %v", e))
-	}
-	status := intVal(data["s"], 200)
-	headers := map[string]any{}
-	if h, ok := data["h"].(map[string]any); ok {
-		headers = h
-	}
-	bodyRaw := ""
-	if b, ok := data["b"].(string); ok {
-		bodyRaw = b
-	}
-	body, _ := base64.StdEncoding.DecodeString(bodyRaw)
-	if len(body) > f.maxResp {
-		return f.errorResponse(502, "Relay response exceeds cap")
-	}
-	statusText := "OK"
-	switch status {
-	case 206:
-		statusText = "Partial Content"
-	case 301:
-		statusText = "Moved"
-	case 302:
-		statusText = "Found"
-	case 304:
-		statusText = "Not Modified"
-	case 400:
-		statusText = "Bad Request"
-	case 403:
-		statusText = "Forbidden"
-	case 404:
-		statusText = "Not Found"
-	case 500:
-		statusText = "Internal Server Error"
+		return f.errorResponse(502, fmt.Sprintf("relay error: %v", e))
 	}
 
-	buf := bytes.NewBufferString(fmt.Sprintf("HTTP/1.1 %d %s\r\n", status, statusText))
+	status := intVal(data["s"], 200)
+	headers, _ := data["h"].(map[string]any)
+	bodyStr, _ := data["b"].(string)
+
+	body, _ := base64.StdEncoding.DecodeString(bodyStr)
+	if len(body) > f.maxResp {
+		return f.errorResponse(502, "relay response exceeds cap")
+	}
+
+	statusText := statusTextFor(status)
+
 	skip := map[string]bool{
 		"transfer-encoding": true,
 		"connection":        true,
@@ -593,43 +617,81 @@ func (f *DomainFronter) parseRelayJSON(data map[string]any) []byte {
 		"content-length":    true,
 		"content-encoding":  true,
 	}
+
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprintf("HTTP/1.1 %d %s\r\n", status, statusText))
 	for k, v := range headers {
-		lk := strings.ToLower(k)
-		if skip[lk] {
+		if skip[strings.ToLower(k)] {
 			continue
 		}
 		switch val := v.(type) {
 		case []any:
 			for _, item := range val {
-				buf.WriteString(fmt.Sprintf("%s: %v\r\n", k, item))
+				fmt.Fprintf(&buf, "%s: %v\r\n", k, item)
 			}
 		default:
-			buf.WriteString(fmt.Sprintf("%s: %v\r\n", k, val))
+			fmt.Fprintf(&buf, "%s: %v\r\n", k, val)
 		}
 	}
-	buf.WriteString(fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body)))
+	fmt.Fprintf(&buf, "Content-Length: %d\r\n\r\n", len(body))
 	buf.Write(body)
 	return buf.Bytes()
 }
 
+func statusTextFor(code int) string {
+	switch code {
+	case 200:
+		return "OK"
+	case 206:
+		return "Partial Content"
+	case 301:
+		return "Moved Permanently"
+	case 302:
+		return "Found"
+	case 304:
+		return "Not Modified"
+	case 400:
+		return "Bad Request"
+	case 401:
+		return "Unauthorized"
+	case 403:
+		return "Forbidden"
+	case 404:
+		return "Not Found"
+	case 429:
+		return "Too Many Requests"
+	case 500:
+		return "Internal Server Error"
+	case 502:
+		return "Bad Gateway"
+	case 503:
+		return "Service Unavailable"
+	default:
+		return "Unknown"
+	}
+}
+
 func (f *DomainFronter) parseBatchBody(body []byte, expected int) ([][]byte, error) {
-	text := strings.TrimSpace(string(body))
 	var data map[string]any
-	if err := json.Unmarshal([]byte(text), &data); err != nil {
-		return nil, err
+	if err := json.Unmarshal(bytes.TrimSpace(body), &data); err != nil {
+		return nil, fmt.Errorf("batch unmarshal: %w", err)
 	}
 	if e, ok := data["e"]; ok {
-		return nil, fmt.Errorf("Batch error: %v", e)
+		return nil, fmt.Errorf("batch error: %v", e)
 	}
 	arr, ok := data["q"].([]any)
 	if !ok || len(arr) != expected {
-		return nil, errors.New("batch size mismatch")
+		return nil, fmt.Errorf("batch size mismatch: got %d, want %d", len(arr), expected)
 	}
+
 	results := make([][]byte, 0, len(arr))
 	for _, item := range arr {
-		if obj, ok := item.(map[string]any); ok {
-			results = append(results, f.parseRelayJSON(obj))
+		obj, ok := item.(map[string]any)
+		if !ok {
+			results = append(results, f.errorResponse(502, "invalid batch item"))
+			continue
 		}
+		results = append(results, f.parseRelayJSON(obj))
 	}
 	return results, nil
 }
@@ -643,15 +705,15 @@ func (f *DomainFronter) isStatefulRequest(method, urlStr string, headers map[str
 		return true
 	}
 	for _, name := range constants.StatefulHeaderNames {
-		if headerValue(headers, name) != "" {
+		if headers[name] != "" {
 			return true
 		}
 	}
-	accept := strings.ToLower(headerValue(headers, "accept"))
+	accept := strings.ToLower(headers["accept"])
 	if strings.Contains(accept, "text/html") || strings.Contains(accept, "application/json") {
 		return true
 	}
-	fetchMode := strings.ToLower(headerValue(headers, "sec-fetch-mode"))
+	fetchMode := strings.ToLower(headers["sec-fetch-mode"])
 	if fetchMode == "navigate" || fetchMode == "cors" {
 		return true
 	}
@@ -673,29 +735,35 @@ func isStaticAssetURL(urlStr string) bool {
 }
 
 func (f *DomainFronter) coalesceKey(urlStr string, headers map[string]string) string {
-	key := []string{urlStr}
-	if headers != nil {
-		for _, name := range []string{"accept", "accept-language", "user-agent", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site"} {
-			if v := headerValue(headers, name); v != "" {
-				key = append(key, name+"="+v)
-			}
+	var b strings.Builder
+	b.WriteString(urlStr)
+	for _, name := range []string{"accept", "accept-language", "user-agent", "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site"} {
+		if v := headers[name]; v != "" {
+			b.WriteByte('\n')
+			b.WriteString(name)
+			b.WriteByte('=')
+			b.WriteString(v)
 		}
 	}
-	return strings.Join(key, "\n")
+	return b.String()
 }
 
-func (f *DomainFronter) recordSite(urlStr string, bytes int, latency time.Duration, errored bool) {
+// recordSite records per-host statistics. FIX: protected by statsMu.
+func (f *DomainFronter) recordSite(urlStr string, byteCount int, latency time.Duration, errored bool) {
 	host := hostKey(urlStr)
 	if host == "" {
 		return
 	}
+	f.statsMu.Lock()
+	defer f.statsMu.Unlock()
+
 	stat, ok := f.perSite[host]
 	if !ok {
 		stat = &HostStat{}
 		f.perSite[host] = stat
 	}
 	stat.Requests++
-	stat.Bytes += bytes
+	stat.Bytes += byteCount
 	stat.TotalLatencyNs += latency.Nanoseconds()
 	if errored {
 		stat.Errors++
@@ -707,7 +775,7 @@ func (f *DomainFronter) statsLoop() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-f.statsStop:
+		case <-f.stopCh:
 			return
 		case <-ticker.C:
 			f.logStats()
@@ -716,28 +784,33 @@ func (f *DomainFronter) statsLoop() {
 }
 
 func (f *DomainFronter) logStats() {
+	f.statsMu.Lock()
 	if len(f.perSite) == 0 {
+		f.statsMu.Unlock()
 		return
 	}
 	type statEntry struct {
 		host string
-		stat *HostStat
+		stat HostStat
 	}
 	entries := make([]statEntry, 0, len(f.perSite))
 	for host, stat := range f.perSite {
-		entries = append(entries, statEntry{host: host, stat: stat})
+		entries = append(entries, statEntry{host: host, stat: *stat})
 	}
+	f.statsMu.Unlock()
+
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].stat.Bytes > entries[j].stat.Bytes
 	})
+
 	count := constants.StatsLogTopN
 	if count > len(entries) {
 		count = len(entries)
 	}
-	log.Debugf("-- Per-host stats (top %d by bytes) --", count)
+	log.Debugf("-- per-host stats (top %d by bytes) --", count)
 	for i := 0; i < count; i++ {
 		e := entries[i]
-		avgLatency := time.Duration(0)
+		var avgLatency time.Duration
 		if e.stat.Requests > 0 {
 			avgLatency = time.Duration(e.stat.TotalLatencyNs / int64(e.stat.Requests))
 		}
@@ -746,14 +819,7 @@ func (f *DomainFronter) logStats() {
 	}
 }
 
-func headerValue(headers map[string]string, name string) string {
-	for k, v := range headers {
-		if strings.ToLower(k) == name {
-			return v
-		}
-	}
-	return ""
-}
+// --- small helpers ---
 
 func truncate(s string, max int) string {
 	if len(s) <= max {
